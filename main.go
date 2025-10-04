@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -19,130 +21,151 @@ type cniConfig struct {
 	types.NetConf
 }
 
+var logger *log.Logger
+
+func initLogger() {
+	logFile, err := os.OpenFile("/tmp/ovn-cni.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatal("Failed to open log file:", err)
+	}
+	logger = log.New(logFile, "", log.LstdFlags)
+}
+
 func createVethPair(containerID, netns string) error {
-	// ip link add veth0 type veth peer name veth1
-	// ip link set veth0 netns $netns
-	// ip netns exec $netns ip link set veth0 up
-	// ip netns exec $netns ip addr add 10.100.1.2/24 dev veth0
-	// ip netns exec $netns ip link set veth0 up
-	// ip netns exec $netns mac address set 00:02:00:00:00:01 dev veth0
+	// Generate unique veth peer name based on containerID
+	vethPeerName := fmt.Sprintf("veth-%s", containerID[:12])
+	logger.Printf("Creating veth pair: veth0 <-> %s for container %s", vethPeerName, containerID)
+
 	veth0 := &netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{
 			Name: "veth0",
 		},
-		PeerName: "veth1",
+		PeerName: vethPeerName,
 	}
 	if err := netlink.LinkAdd(veth0); err != nil {
-		fmt.Println("netlink.LinkAdd error for veth0", err)
+		logger.Printf("netlink.LinkAdd error for veth0: %v", err)
 		return err
 	}
 
-	// lets deal with veth1, it got created as part of veth peer and now it is in the host namespace
-	// ip link set veth1 up
-	veth1, err := netlink.LinkByName("veth1")
+	// lets deal with the peer veth, it got created as part of veth peer and now it is in the host namespace
+	vethPeer, err := netlink.LinkByName(vethPeerName)
 	if err != nil {
-		fmt.Println("netlink.LinkByName error for veth1", err)
+		logger.Printf("netlink.LinkByName error for %s: %v", vethPeerName, err)
 		return err
 	}
-	if err := netlink.LinkSetUp(veth1); err != nil {
-		fmt.Println("netlink.LinkSetUp error for veth1", err)
+	if err := netlink.LinkSetUp(vethPeer); err != nil {
+		logger.Printf("netlink.LinkSetUp error for %s: %v", vethPeerName, err)
 		return err
 	}
 
 	netnsFd, err := ns.GetNS(netns)
 	if err != nil {
-		fmt.Println("ns.GetNS error for netns", err)
+		logger.Printf("ns.GetNS error for netns: %v", err)
 		return err
 	}
 	if err := netlink.LinkSetNsFd(veth0, int(netnsFd.Fd())); err != nil {
-		fmt.Println("netlink.LinkSetNsFd error for veth0", err)
+		logger.Printf("netlink.LinkSetNsFd error for veth0: %v", err)
 		return err
 	}
 	ipStr := "10.100.1.2"
 	macStr := "00:02:00:00:00:01"
 	// Create logical switch port
-	portName := fmt.Sprintf("pod-%s", containerID[:12]) // or whatever naming
+	portName := fmt.Sprintf("pod-%s", containerID[:12])
+	logger.Printf("Configuring veth0 in container namespace with IP: %s, MAC: %s", ipStr, macStr)
+
 	// Enter the container's network namespace before configuring the interface.
-	// Use github.com/containernetworking/plugins/pkg/ns for ns handling.
 	err = ns.WithNetNSPath(netns, func(_ ns.NetNS) error {
 		link, err := netlink.LinkByName("veth0")
 		if err != nil {
-			fmt.Println("netlink.LinkByName error for veth0", err)
+			logger.Printf("netlink.LinkByName error for veth0: %v", err)
 			return err
 		}
 		if err := netlink.LinkSetUp(link); err != nil {
-			fmt.Println("netlink.LinkSetUp error for veth0", err)
+			logger.Printf("netlink.LinkSetUp error for veth0: %v", err)
 			return err
 		}
-		// Define IP address and MAC address variables
 
 		addr, err := netlink.ParseAddr(ipStr + "/24")
 		if err != nil {
-			fmt.Println("netlink.ParseAddr error for veth0", err)
+			logger.Printf("netlink.ParseAddr error for veth0: %v", err)
 			return err
 		}
 		if err := netlink.AddrAdd(link, addr); err != nil {
-			fmt.Println("netlink.AddrAdd error for veth0", err)
+			logger.Printf("netlink.AddrAdd error for veth0: %v", err)
 			return err
 		}
 
 		mac, err := net.ParseMAC(macStr)
 		if err != nil {
-			fmt.Println("net.ParseMAC error for veth0", err)
+			logger.Printf("net.ParseMAC error for veth0: %v", err)
 			return err
 		}
 		if err := netlink.LinkSetHardwareAddr(link, mac); err != nil {
-			fmt.Println("netlink.LinkSetHardwareAddr error for veth0", err)
+			logger.Printf("netlink.LinkSetHardwareAddr error for veth0: %v", err)
 			return err
 		}
 		return nil
 	})
 	if err != nil {
-		fmt.Println("ns.WithNetNSPath error for veth0", err)
+		logger.Printf("ns.WithNetNSPath error for veth0: %v", err)
 		return err
 	}
 
-	fmt.Println("createVethPair success for veth0")
+	logger.Printf("Successfully configured veth0 in container namespace")
 
-	cmd := exec.Command("ovs-vsctl", "add-port", "br-int", "veth1")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to add port to br-int: %v", err)
+	// Add the peer veth to OVS bridge
+	logger.Printf("Adding %s to br-int OVS bridge", vethPeerName)
+	cmd := exec.Command("ovs-vsctl", "add-port", "br-int", vethPeerName)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		logger.Printf("Failed to add port to br-int: %v, output: %s", err, string(output))
+		return fmt.Errorf("failed to add port to br-int: %v, output: %s", err, string(output))
 	}
 
-	fmt.Println("exec.Command success for ovs-vsctl add-port br-int veth1")
-	cmd = exec.Command("ovs-vsctl", "set", "interface", "veth1",
+	logger.Printf("Successfully added %s to br-int", vethPeerName)
+	cmd = exec.Command("ovs-vsctl", "set", "interface", vethPeerName,
 		fmt.Sprintf("external_ids:iface-id=%s", portName))
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to set interface veth1: %v", err)
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		logger.Printf("Failed to set interface %s: %v, output: %s", vethPeerName, err, string(output))
+		return fmt.Errorf("failed to set interface %s: %v, output: %s", vethPeerName, err, string(output))
 	}
-	// we need to move this side of the veth to the ovs bridge called br-int
-	fmt.Println("createVethPair success for veth1")
+	logger.Printf("Successfully set external_ids:iface-id=%s for %s", portName, vethPeerName)
 
-	// now we need to add the togical topology to ovn
+	// Now add the logical topology to OVN
+	logger.Printf("Configuring OVN logical switch port")
 
 	// Get the ovn-remote from OVS
 	cmd = exec.Command("ovs-vsctl", "get", "open_vswitch", ".", "external_ids:ovn-remote")
-	output, err := cmd.Output()
+	output, err = cmd.CombinedOutput()
 	if err != nil {
-		return err
+		logger.Printf("Failed to get ovn-remote: %v, output: %s", err, string(output))
+		return fmt.Errorf("failed to get ovn-remote: %v, output: %s", err, string(output))
 	}
 	// output will be like: "tcp:172.16.0.2:6642"
 	// Parse it and change 6642 -> 6641 for northbound
 	ovnRemote := strings.Trim(string(output), "\"\n")
 	ovnNB := strings.Replace(ovnRemote, "6642", "6641", 1)
+	logger.Printf("Using OVN NB database: %s", ovnNB)
 
 	cmd = exec.Command("ovn-nbctl", fmt.Sprintf("--db=%s", ovnNB),
 		"lsp-add", "ls1", portName)
-	if err := cmd.Run(); err != nil {
-		return err
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		logger.Printf("Failed to add logical switch port: %v, output: %s", err, string(output))
+		return fmt.Errorf("failed to add logical switch port: %v, output: %s", err, string(output))
 	}
+	logger.Printf("Successfully added logical switch port: %s", portName)
 
 	// Set addresses
 	cmd = exec.Command("ovn-nbctl", fmt.Sprintf("--db=%s", ovnNB),
 		"lsp-set-addresses", portName, fmt.Sprintf("%s %s", macStr, ipStr))
-	if err := cmd.Run(); err != nil {
-		return err
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		logger.Printf("Failed to set addresses: %v, output: %s", err, string(output))
+		return fmt.Errorf("failed to set addresses: %v, output: %s", err, string(output))
 	}
+	logger.Printf("Successfully set addresses %s %s for port %s", macStr, ipStr, portName)
 
 	return nil
 }
@@ -150,14 +173,13 @@ func createVethPair(containerID, netns string) error {
 func cmdAdd(args *skel.CmdArgs) error {
 	var conf cniConfig
 	if err := json.Unmarshal(args.StdinData, &conf); err != nil {
-		fmt.Println("cmdAdd unmarshal error", err)
+		logger.Printf("cmdAdd unmarshal error: %v", err)
 		return err
 	}
-	fmt.Println("received cmdAdd cni config", conf)
-	// create veth pair and move one side to container namespace
+	logger.Printf("Received cmdAdd for container %s, netns: %s", args.ContainerID, args.Netns)
 
 	if err := createVethPair(args.ContainerID, args.Netns); err != nil {
-		fmt.Println("createVethPair error", err)
+		logger.Printf("createVethPair error: %v", err)
 		return err
 	}
 
@@ -170,25 +192,30 @@ func cmdAdd(args *skel.CmdArgs) error {
 					IP:   net.ParseIP("10.100.1.2"),
 					Mask: net.CIDRMask(24, 32),
 				},
-				Gateway: net.ParseIP("10.100.1.1"), // optional for now
+				Gateway: net.ParseIP("10.100.1.1"),
 			},
 		},
 	}
 
+	logger.Printf("cmdAdd completed successfully for container %s", args.ContainerID)
 	return types.PrintResult(result, conf.CNIVersion)
 }
 
 func cmdDel(args *skel.CmdArgs) error {
 	var conf cniConfig
 	if err := json.Unmarshal(args.StdinData, &conf); err != nil {
-		fmt.Println("cmdDel unmarshal error", err)
+		logger.Printf("cmdDel unmarshal error: %v", err)
 		return err
 	}
-	fmt.Println("received cmdDel cni config", conf)
+	logger.Printf("Received cmdDel for container %s", args.ContainerID)
+	// TODO: Implement cleanup logic
 	return nil
 }
 
 func main() {
+	initLogger()
+	logger.Printf("Starting OVN CNI plugin")
+
 	skel.PluginMainFuncs(skel.CNIFuncs{
 		Add: cmdAdd,
 		Del: cmdDel,
