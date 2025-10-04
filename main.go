@@ -36,6 +36,19 @@ func createVethPair(containerID, netns string) error {
 		fmt.Println("netlink.LinkAdd error for veth0", err)
 		return err
 	}
+
+	// lets deal with veth1, it got created as part of veth peer and now it is in the host namespace
+	// ip link set veth1 up
+	veth1, err := netlink.LinkByName("veth1")
+	if err != nil {
+		fmt.Println("netlink.LinkByName error for veth1", err)
+		return err
+	}
+	if err := netlink.LinkSetUp(veth1); err != nil {
+		fmt.Println("netlink.LinkSetUp error for veth1", err)
+		return err
+	}
+
 	netnsFd, err := ns.GetNS(netns)
 	if err != nil {
 		fmt.Println("ns.GetNS error for netns", err)
@@ -90,18 +103,6 @@ func createVethPair(containerID, netns string) error {
 	}
 
 	fmt.Println("createVethPair success for veth0")
-
-	// lets deal with veth1, it got created as part of veth peer and now it is in the host namespace
-	// ip link set veth1 up
-	veth1, err := netlink.LinkByName("veth1")
-	if err != nil {
-		fmt.Println("netlink.LinkByName error for veth1", err)
-		return err
-	}
-	if err := netlink.LinkSetUp(veth1); err != nil {
-		fmt.Println("netlink.LinkSetUp error for veth1", err)
-		return err
-	}
 
 	cmd := exec.Command("ovs-vsctl", "add-port", "br-int", "veth1")
 	if err := cmd.Run(); err != nil {
