@@ -36,6 +36,14 @@ func createVethPair(containerID, netns string) error {
 	vethPeerName := fmt.Sprintf("veth-%s", containerID[:12])
 	logger.Printf("Creating veth pair: veth0 <-> %s for container %s", vethPeerName, containerID)
 
+	// Check if veth peer already exists in host namespace and delete it
+	if existingLink, err := netlink.LinkByName(vethPeerName); err == nil {
+		logger.Printf("Found existing interface %s, deleting it first", vethPeerName)
+		if err := netlink.LinkDel(existingLink); err != nil {
+			logger.Printf("Failed to delete existing %s: %v", vethPeerName, err)
+		}
+	}
+
 	veth0 := &netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{
 			Name: "veth0",
@@ -58,11 +66,29 @@ func createVethPair(containerID, netns string) error {
 		return err
 	}
 
+	// Check and clean up any existing veth0 in the target namespace
 	netnsFd, err := ns.GetNS(netns)
 	if err != nil {
 		logger.Printf("ns.GetNS error for netns: %v", err)
 		return err
 	}
+
+	// Clean up old veth0 if it exists in the target namespace
+	err = ns.WithNetNSPath(netns, func(_ ns.NetNS) error {
+		if oldLink, err := netlink.LinkByName("veth0"); err == nil {
+			logger.Printf("Found existing veth0 in target namespace, deleting it")
+			if err := netlink.LinkDel(oldLink); err != nil {
+				logger.Printf("Failed to delete existing veth0: %v", err)
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		logger.Printf("Error during veth0 cleanup: %v", err)
+		return err
+	}
+
 	if err := netlink.LinkSetNsFd(veth0, int(netnsFd.Fd())); err != nil {
 		logger.Printf("netlink.LinkSetNsFd error for veth0: %v", err)
 		return err
@@ -208,7 +234,51 @@ func cmdDel(args *skel.CmdArgs) error {
 		return err
 	}
 	logger.Printf("Received cmdDel for container %s", args.ContainerID)
-	// TODO: Implement cleanup logic
+
+	// Clean up veth peer in host namespace
+	vethPeerName := fmt.Sprintf("veth-%s", args.ContainerID[:12])
+	portName := fmt.Sprintf("pod-%s", args.ContainerID[:12])
+
+	// Remove from OVS bridge
+	logger.Printf("Removing %s from br-int", vethPeerName)
+	cmd := exec.Command("ovs-vsctl", "del-port", "br-int", vethPeerName)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		logger.Printf("Failed to remove port from br-int (may not exist): %v, output: %s", err, string(output))
+		// Don't return error, continue cleanup
+	}
+
+	// Delete the veth peer interface (this will also delete veth0 in the container)
+	if link, err := netlink.LinkByName(vethPeerName); err == nil {
+		logger.Printf("Deleting interface %s", vethPeerName)
+		if err := netlink.LinkDel(link); err != nil {
+			logger.Printf("Failed to delete %s: %v", vethPeerName, err)
+		}
+	} else {
+		logger.Printf("Interface %s not found (may already be deleted)", vethPeerName)
+	}
+
+	// Remove OVN logical switch port
+	cmd = exec.Command("ovs-vsctl", "get", "open_vswitch", ".", "external_ids:ovn-remote")
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		logger.Printf("Failed to get ovn-remote during cleanup: %v", err)
+		return nil // Don't fail if we can't clean up OVN
+	}
+
+	ovnRemote := strings.Trim(string(output), "\"\n")
+	ovnNB := strings.Replace(ovnRemote, "6642", "6641", 1)
+
+	logger.Printf("Removing logical switch port %s", portName)
+	cmd = exec.Command("ovn-nbctl", fmt.Sprintf("--db=%s", ovnNB),
+		"--if-exists", "lsp-del", portName)
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		logger.Printf("Failed to delete logical switch port: %v, output: %s", err, string(output))
+		// Don't return error
+	}
+
+	logger.Printf("cmdDel completed for container %s", args.ContainerID)
 	return nil
 }
 
