@@ -33,7 +33,9 @@ func initLogger() {
 
 func createVethPair(containerID, netns string) error {
 	// Generate unique veth peer name based on containerID
-	vethPeerName := fmt.Sprintf("veth-%s", containerID[:12])
+	// Linux interface names have a max length of 15 chars (IFNAMSIZ - 1)
+	// Format: veth + 8 chars from containerID = 12 chars total
+	vethPeerName := fmt.Sprintf("veth%s", containerID[:8])
 	logger.Printf("Creating veth pair: veth0 <-> %s for container %s", vethPeerName, containerID)
 
 	// Check if veth peer already exists in host namespace and delete it
@@ -236,7 +238,7 @@ func cmdDel(args *skel.CmdArgs) error {
 	logger.Printf("Received cmdDel for container %s", args.ContainerID)
 
 	// Clean up veth peer in host namespace
-	vethPeerName := fmt.Sprintf("veth-%s", args.ContainerID[:12])
+	vethPeerName := fmt.Sprintf("veth%s", args.ContainerID[:8])
 	portName := fmt.Sprintf("pod-%s", args.ContainerID[:12])
 
 	// Remove from OVS bridge
