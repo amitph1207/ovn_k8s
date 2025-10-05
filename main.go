@@ -54,6 +54,10 @@ func getVethPeerName(containerID string) (string, error) {
 	return fmt.Sprintf("veth%s", containerID[:8]), nil
 }
 
+func getGatewayIP() (string, error) {
+	return "10.100.1.1", nil
+}
+
 func createVethPair(containerID, netns string) error {
 	// Generate unique veth peer name based on containerID
 	// Linux interface names have a max length of 15 chars (IFNAMSIZ - 1)
@@ -80,6 +84,12 @@ func createVethPair(containerID, netns string) error {
 	macStr, err := getMACAddress(containerID)
 	if err != nil {
 		logger.Printf("getMACAddress error: %v", err)
+		return err
+	}
+
+	gwIP, err := getGatewayIP()
+	if err != nil {
+		logger.Printf("getGatewayIP error: %v", err)
 		return err
 	}
 
@@ -176,6 +186,15 @@ func createVethPair(containerID, netns string) error {
 			logger.Printf("netlink.LinkSetHardwareAddr error for veth0: %v", err)
 			return err
 		}
+
+		gw := net.ParseIP(gwIP)
+		route := &netlink.Route{
+			LinkIndex: link.Attrs().Index,
+			Dst:       nil,
+			Gw:        gw,
+		}
+		netlink.RouteAdd(route)
+		logger.Printf("Successfully added default route to %s", gwIP)
 		return nil
 	})
 	if err != nil {
@@ -261,6 +280,11 @@ func cmdAdd(args *skel.CmdArgs) error {
 		logger.Printf("Failed to get IP address for result: %v", err)
 		return err
 	}
+	gwIP, err := getGatewayIP()
+	if err != nil {
+		logger.Printf("Failed to get gateway IP for result: %v", err)
+		return err
+	}
 	result := &current.Result{
 		CNIVersion: conf.CNIVersion,
 		IPs: []*current.IPConfig{
@@ -269,7 +293,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 					IP:   net.ParseIP(ipStr),
 					Mask: net.CIDRMask(24, 32),
 				},
-				Gateway: net.ParseIP("10.100.1.1"),
+				Gateway: net.ParseIP(gwIP),
 			},
 		},
 	}
