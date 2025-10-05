@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/containernetworking/cni/pkg/skel"
@@ -31,11 +32,57 @@ func initLogger() {
 	logger = log.New(logFile, "", log.LstdFlags)
 }
 
+func getIPAddress(containerID string) (string, error) {
+	lastBytes := containerID[len(containerID)-4:]
+	val, _ := strconv.ParseInt(lastBytes, 16, 64)
+	ip := fmt.Sprintf("10.100.1.%d", (val%250)+2) // Range: 10.100.1.2 - 10.100.1.251
+	return ip, nil
+}
+
+func getMACAddress(containerID string) (string, error) {
+	lastBytes := containerID[len(containerID)-4:]
+	val, _ := strconv.ParseInt(lastBytes, 16, 64)
+	mac := fmt.Sprintf("00:02:00:00:00:%02X", (val%250)+2) // Range: 00:02:00:00:00:02 - 00:02:00:00:00:FF
+	return mac, nil
+}
+
+func getPortName(containerID string) (string, error) {
+	return fmt.Sprintf("pod-%s", containerID[:12]), nil
+}
+
+func getVethPeerName(containerID string) (string, error) {
+	return fmt.Sprintf("veth%s", containerID[:8]), nil
+}
+
 func createVethPair(containerID, netns string) error {
 	// Generate unique veth peer name based on containerID
 	// Linux interface names have a max length of 15 chars (IFNAMSIZ - 1)
 	// Format: veth + 8 chars from containerID = 12 chars total
-	vethPeerName := fmt.Sprintf("veth%s", containerID[:8])
+
+	vethPeerName, err := getVethPeerName(containerID)
+	if err != nil {
+		logger.Printf("getVethPeerName error: %v", err)
+		return err
+	}
+
+	portName, err := getPortName(containerID)
+	if err != nil {
+		logger.Printf("getPortName error: %v", err)
+		return err
+	}
+
+	ipStr, err := getIPAddress(containerID)
+	if err != nil {
+		logger.Printf("getIPAddress error: %v", err)
+		return err
+	}
+
+	macStr, err := getMACAddress(containerID)
+	if err != nil {
+		logger.Printf("getMACAddress error: %v", err)
+		return err
+	}
+
 	logger.Printf("Creating veth pair: veth0 <-> %s for container %s", vethPeerName, containerID)
 
 	// Check if veth peer already exists in host namespace and delete it
@@ -95,10 +142,7 @@ func createVethPair(containerID, netns string) error {
 		logger.Printf("netlink.LinkSetNsFd error for veth0: %v", err)
 		return err
 	}
-	ipStr := "10.100.1.2"
-	macStr := "00:02:00:00:00:01"
-	// Create logical switch port
-	portName := fmt.Sprintf("pod-%s", containerID[:12])
+
 	logger.Printf("Configuring veth0 in container namespace with IP: %s, MAC: %s", ipStr, macStr)
 
 	// Enter the container's network namespace before configuring the interface.
