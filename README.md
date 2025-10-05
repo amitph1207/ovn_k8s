@@ -1,12 +1,15 @@
-Simple implementation of ovn based kubernetes CNI
+# OVN-based Kubernetes CNI
 
-Why?
-- to learn ovn
-- to understand ovn-k8s-cni better
+Simple implementation of OVN based Kubernetes CNI
 
+## Why?
 
-Current testcases it can handle:
-- pod to pod on same node
-- pod to pod on different node
-- pod to external world
-- external world to pod
+- To learn OVN
+- To understand ovn-k8s-cni better
+
+## Current testcases it can handle
+
+- Pod to pod on same node
+- Pod to pod on different node
+- Pod to external world
+- External world to pod
