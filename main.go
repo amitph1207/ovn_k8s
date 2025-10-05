@@ -255,13 +255,18 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return err
 	}
 
-	// Build the result
+	// Build the result using the IP address that was set on the interface
+	ipStr, err := getIPAddress(args.ContainerID)
+	if err != nil {
+		logger.Printf("Failed to get IP address for result: %v", err)
+		return err
+	}
 	result := &current.Result{
 		CNIVersion: conf.CNIVersion,
 		IPs: []*current.IPConfig{
 			{
 				Address: net.IPNet{
-					IP:   net.ParseIP("10.100.1.2"),
+					IP:   net.ParseIP(ipStr),
 					Mask: net.CIDRMask(24, 32),
 				},
 				Gateway: net.ParseIP("10.100.1.1"),
